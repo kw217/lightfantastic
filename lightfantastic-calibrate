@@ -130,6 +130,12 @@ if __name__ == "__main__":
 
     print("Press Ctrl-C to quit.")
 
-    metronome = Metronome(args.clock)
-    while True:
-        tree(strip, metronome)
+    try:
+        metronome = Metronome(args.clock)
+        while True:
+            tree(strip, metronome)
+    except KeyboardInterrupt:
+        col = Color(0, 0, 0)
+        for i in range(strip.numPixels()):
+            strip.setPixelColor(i, col)
+        strip.show()
