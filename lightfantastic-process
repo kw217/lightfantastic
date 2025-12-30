@@ -8,11 +8,8 @@
 import argparse
 import numpy as np
 import cv2
-import time
 import collections
-import copy
 import math
-import time
 import pickle
 from operator import itemgetter
 from collections import defaultdict
@@ -21,6 +18,7 @@ from itertools import tee
 from math import *
 from lightfantastic.ids import *
 from lightfantastic.spatial import *
+import statistics
 
 ZERO_COLOUR = (0, 0, 255)
 
@@ -32,6 +30,10 @@ class LED(Sequence):
         self.idv = idv
         self.timestamp = collections.deque(maxlen=100000)
         self.timestamp.append(tim)
+        self.levels = []
+
+    def __str__(self):
+        return f"({self.x},{self.y}) {self.idv}: {self.timestamp}"
 
     def __getitem__(self, i):
         return [self.x, self.y][i]
@@ -54,6 +56,9 @@ class LED(Sequence):
     def addtimestamp(self, tstamp):
         self.timestamp.append(tstamp)
 
+    def addlevel(self, level):
+        self.levels.append(level)
+
 
 # Detect blobs in frame
 def blobdetect(frame):
@@ -72,15 +77,26 @@ def blobdetect(frame):
     return detector.detect(frame)
 
 
-# Find nearest potential LED
 def nearesti(allh, search, dist, spatial, rect, brute):
+    """
+    Find nearest potential LED
+
+    :param allh: LEDs to search through
+    :param search: LED to match
+    :param dist: Max distance (brute mode only)
+    :param spatial: Collection of collision rectangles (non-brute mode only)
+    :param rect: Current rectangle
+    :param brute: Boolean: brute-force mode? (vs collision detection)
+    """
 
     found = []
     if brute:
+        dist2 = dist * dist
         for idv in allh:
             ldv = allh[idv]
-            dst = math.sqrt((search.x - ldv.x) ** 2 + (search.y - ldv.y) ** 2)
-            if dst < dist:
+            dst2 = (search.x - ldv.x) ** 2 + (search.y - ldv.y) ** 2
+            if dst2 < dist2:
+                dst = math.sqrt(dst2)
                 found.append((dst, ldv))
         return sorted(found, key=itemgetter(0))
     else:
@@ -120,33 +136,6 @@ def mancdec(arr):
     return out
 
 
-# Extract bits from frame differences, this then needs to be decoded
-# using the mancdec function
-def getbits(framediffs, fps, timethreshold):
-
-    nout = 0
-    bits = []
-    f = ((1 / fps) * 1.5) * 1000
-
-    for framediff in framediffs:
-        if framediff < f:
-            nout = nout + 1
-        else:
-            if nout * ((1 / fps) * 1000) <= timethreshold:
-                bits.append(1)
-            else:
-                bits.extend([1, 1])
-
-            if framediff <= timethreshold:
-                bits.append(0)
-            else:
-                bits.extend([0, 0])
-
-            nout = 1
-
-    return bits
-
-
 # Calculate CRC checksum
 def crc(val):
     s = ""
@@ -160,11 +149,10 @@ def getblobs(videofile, brute):
 
     spatial = SpatialHash()
     cap = cv2.VideoCapture(videofile)
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    official_fps = cap.get(cv2.CAP_PROP_FPS)
     potentialleds = {}
-    blobframes = []
     fcount = 0
-    fps = 0
+    calc_fps = 0
     frameno = 0
     old = -1
     uid = 0
@@ -174,10 +162,10 @@ def getblobs(videofile, brute):
         # Calculate framerate
         timestamp = int(cap.get(cv2.CAP_PROP_POS_MSEC))
         fcount = fcount + 1
-        if fcount > fps:
+        if fcount > calc_fps:
             frameno = frameno + 1
             if timestamp > old + 1000 and frameno > 1:
-                fps = frameno
+                calc_fps = frameno
                 frameno = 0
                 old = timestamp
 
@@ -202,6 +190,7 @@ def getblobs(videofile, brute):
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
+        fps = official_fps
         cur = []
         if fps > 20:
 
@@ -244,6 +233,138 @@ def getblobs(videofile, brute):
     return lastf, potentialleds, fps
 
 
+# For each candidate, store the average level around it in every frame.
+def getlevels(movie, potentialleds):
+    cap = cv2.VideoCapture(movie)
+    while True:
+        ret, frame = cap.read()
+        if type(frame) != np.ndarray:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        for idv in potentialleds:
+            led = potentialleds[idv]
+            patch = frame[int(led.y)-1:int(led.y)+2, int(led.x)-1:int(led.x)+2]
+            level = np.average(patch)
+            led.addlevel(level)
+
+    cap.release()
+
+
+def decodeleds(potentialleds, clock, debounce, debug):
+    count_g20 = 0
+    count_preamble = 0
+    count_crc = 0
+    tagged_leds = {}
+    framethreshold = fps / clock
+
+    for key in potentialleds:
+        if debug:
+            print(f"Key {key}")
+        t = potentialleds[key].timestamp
+        led = potentialleds[key]
+
+        if len(t) > 20:
+            count_g20 += 1
+
+            if debug:
+                print(f"Flevels {led.levels}")
+
+            # Threshold by median
+            median = statistics.median(led.levels)
+            levels = [1 if f > median else 0 for f in led.levels]
+
+            if debounce:
+                # Debounce levels
+                debounced = []
+                for i in range(len(levels)-2):
+                    if levels[i:i+3] == [1,0,1]:
+                        debounced.append(1)
+                    elif levels[i:i+3] == [0,1,0]:
+                        debounced.append(0)
+                    else:
+                        debounced.append(levels[i+1])
+
+                if debug:
+                    print(f"Debounced {debounced}")
+                levels = debounced
+
+            if debug:
+                # Histogram of run lengths, to help guess clock rate
+                lengths = {}
+                last = None
+                count = 0
+                for b in levels:
+                    if last != b:
+                        if count not in lengths:
+                            lengths[count] = 1
+                        else:
+                            lengths[count] += 1
+                        last = b
+                        count = 1
+                    else:
+                        count += 1
+                for l in sorted(lengths):
+                    bar = lengths[l] * "]"
+                    print(f"{l:3}: {bar:40} {lengths[l]:2}")
+
+            # Extract raw bits
+            bits = []
+            count = 0
+            state = 1
+            for i in range(len(levels)):
+                if levels[i] == state:
+                    count += 1
+                else:
+                    numperiods = int(count / framethreshold + 0.5)
+                    bits.extend(numperiods * [state])
+                    state = levels[i]
+                    count = 0
+
+            if debug:
+                bits_s = "".join(["1" if b else "o" for b in bits])
+                print(f"Bits: {bits_s}")
+            found = False
+
+            most = defaultdict(int)
+            for x in window(bits, 68):
+                # Check for preamble
+                n2 = [z for z in x]
+                pre = n2[:32]
+
+                if pre == mp:
+                    # Decode
+                    if debug:
+                        print(f"mp key {key} {bits}")
+                    count_preamble += 1
+                    m = mancdec(n2)
+                    check = binary(m[-8:])
+                    bbb = binary(m[16 : 16 + 10])
+
+                    # Check CRC
+                    if crc(m[0 : 16 + 10]) == check:
+                        count_crc += 1
+                        most[bbb] = most[bbb] + 1
+                        found = True
+                        break
+
+            last = 0
+            idv = -1
+            for k in most:
+                if most[k] > last:
+                    idv = k
+                    last = most[k]
+
+            if found:
+                # Add this LED to output set
+                tup = (int(led.x), int(led.y), idv)
+                tagged_leds[idv] = tup
+
+    print(f"Candidates with at least 20 frames: {count_g20}\nPreambles matched: {count_preamble}\nCorrect CRC: {count_crc}")
+
+    return tagged_leds
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="CLI for lightfantastic")
@@ -262,78 +383,70 @@ if __name__ == "__main__":
         required=True,
     )
     parser.add_argument(
-        "--timethreshold",
-        dest="timethreshold",
-        nargs="?",
-        const=1,
-        type=int,
-        default=300,
-        help="Time threshold (default: 300ms)",
-    )
-    parser.add_argument(
         "--brute",
         dest="brute",
         nargs="?",
         default=False,
         help="Bruteforce find nearby LEDs",
     )
+    parser.add_argument(
+        "--intermediate",
+        dest="intermediate",
+        type=str,
+        default="intermediate.p",
+        help="Filename to hold intermediate state",
+    )
+    parser.add_argument(
+        "--rescan",
+        dest="rescan",
+        action="store_true",
+        help="Use intermediate state rather than loading movie file",
+    )
+    parser.add_argument(
+        "--debounce",
+        dest="debounce",
+        action="store_true",
+        help="Apply simple debouncing to clean up bitstream before decoding",
+    )
+    parser.add_argument(
+        "--debug",
+        dest="debug",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--clock",
+        dest="clock",
+        type=float,
+        help="Bit clock rate in hertz",
+        default=4.8,
+    )
 
     args = parser.parse_args()
     movie = args.movie.name
-    timethreshold = args.timethreshold
     args.movie.close()
     brute = not (args.brute == False)
     mp = IDs(0).manchester(IDs(0).preamble)
-    tagged_leds = {}
-    lastf, potentialleds, fps = getblobs(movie, brute)
+
+    if not args.rescan:
+        # Find all the blobs
+        lastf, potentialleds, fps = getblobs(movie, brute)
+
+        # Now reload the video, and get the levels for each possible LED
+        getlevels(movie, potentialleds)
+
+        pickle.dump((lastf, potentialleds, fps), open(args.intermediate, "wb"))
+
+    (lastf, potentialleds, fps) = pickle.load(open(args.intermediate, "rb"))
+    print(f"Video: {fps}fps")
 
     # Find valid LEDs
-    for key in potentialleds:
-        t = potentialleds[key].timestamp
-        led = potentialleds[key]
-
-        if len(t) > 20:
-            t2 = [t[i] for i in range(1, len(t))]
-            old = t2[0]
-            out = []
-
-            for v in t2[1:]:
-                out.append(v - old)
-                old = v
-
-            bits = getbits(out, fps, timethreshold)
-            found = False
-
-            most = defaultdict(int)
-            for x in window(bits, 68):
-                n2 = [z for z in x]
-                pre = n2[:32]
-
-                if pre == mp:
-                    m = mancdec(n2)
-                    check = binary(m[-8:])
-                    bbb = binary(m[16 : 16 + 10])
-
-                    if crc(m[0 : 16 + 10]) == check:
-                        most[bbb] = most[bbb] + 1
-                        found = True
-                        break
-
-            last = 0
-            idv = -1
-            tup = (led.x, led.y)
-            for k in most:
-                if most[k] > last:
-                    idv = k
-                    last = most[k]
-
-            if found:
-                tagged_leds[idv] = tup
+    tagged_leds = decodeleds(potentialleds, args.clock, args.debounce, args.debug)
 
     # Display tagged LEDs on last processed video frame
     numleds = 0
     for led_id in tagged_leds:
         numleds += 1
+        # print(led_id)
         led_pos = tagged_leds[led_id]
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(
@@ -347,9 +460,10 @@ if __name__ == "__main__":
             cv2.LINE_AA,
         )
 
-    print("Found ", numleds)
+    print(f"Found {numleds} from {len(potentialleds)} candidates")
 
     pickle.dump(tagged_leds, open(args.out, "wb"))
+
     cv2.imshow("Video", lastf)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
