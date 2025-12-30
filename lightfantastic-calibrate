@@ -13,7 +13,21 @@ from neopixel import *
 
 LEDs = []
 
-def tree(strip, wait_ms=100):
+class Metronome:
+    def __init__(self, clock_hz):
+        self.period = 1 / clock_hz
+        self.deadline = None
+
+    def tick(self):
+        now = time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+        if self.deadline:
+            if now < self.deadline:
+                time.sleep(self.deadline - now)
+        else:
+            self.deadline = now
+        self.deadline += self.period
+
+def tree(strip, metronome):
 
     for i in range(strip.numPixels()):
         v = LEDs[i].get()
@@ -23,9 +37,8 @@ def tree(strip, wait_ms=100):
             col = Color(255, 255, 255)
         strip.setPixelColor(i, col)
 
+    metronome.tick()
     strip.show()
-    time.sleep(wait_ms / 1000.0)
-
 
 # Main program logic follows
 if __name__ == "__main__":
@@ -33,13 +46,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CLI for lightfantastic calibration lights")
 
     parser.add_argument(
-        "--wait",
-        dest="wait",
-        nargs="?",
-        const=1,
-        type=int,
-        default=100,
-        help="Wait time in milliseconds",
+        "--clock",
+        dest="clock",
+        type=float,
+        help="Bit clock rate in hertz",
+        default=4.8,
     )
 
     parser.add_argument(
@@ -106,9 +117,9 @@ if __name__ == "__main__":
     for i in range(args.count):
         LEDs.append(IDs(i))
 
-    print("Using: %d LEDs, Pin: %d, Freq: %d Hz, DMA: %d, Invert: %r, Brightness: %d, Wait: %d ms"  
-           % (  args.count, args.pin, args.freq, args.dma, LED_INVERT, args.brightness, args.wait ))
-    
+    print("Using: %d LEDs, Pin: %d, Freq: %d Hz, DMA: %d, Invert: %r, Brightness: %d, Clock: %0.1f Hz"
+           % (  args.count, args.pin, args.freq, args.dma, LED_INVERT, args.brightness, args.clock ))
+
     # Create NeoPixel object with appropriate configuration.
     strip = Adafruit_NeoPixel(
         args.count, args.pin, args.freq, args.dma, LED_INVERT, args.brightness
@@ -119,5 +130,6 @@ if __name__ == "__main__":
 
     print("Press Ctrl-C to quit.")
 
+    metronome = Metronome(args.clock)
     while True:
-        tree(strip,args.wait)
+        tree(strip, metronome)
